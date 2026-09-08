@@ -17,8 +17,8 @@
 |---|---|
 | 数据面引擎可插拔 | `LOCK_FREE`（默认，SP 无锁哈希 + per-thread 精确 size）vs `SYNCHRONIZED`（全锁基线，供对比） |
 | 精确 size() | 无锁引擎由 SP per-thread 计数器求和：O(写线程数)、无锁、不阻塞写 |
-| 容量上限 + 驱逐 | `maxSize` + `FIFO` / 近似 `LRU`（读计数采样 + 周期性提升），`RemovalListener(EVICTED)` |
-| per-key TTL | `expireAfterWrite`：读时惰性判过期(miss) + 写池周期清扫，`RemovalListener(EXPIRED)` |
+| 容量上限 + 驱逐 | `maxSize` + `FIFO` / 近似 `LRU`（读计数 + 驱逐点 CLOCK 二次机会），`RemovalListener(EVICTED)` |
+| per-key TTL | `expireAfterWrite`：读/写触发惰性判定(miss) + 写池时间闸清扫，`RemovalListener(EXPIRED)` |
 | 显式失效 | `invalidate(key)` —— "写库后失效缓存"一致性用法 |
 | 读穿 + 单飞加载 | `get(key, loader)`：未命中单飞加载，防缓存击穿/惊群 |
 | 统计 | 命中/未命中/驱逐/过期/加载次数，`CacheStats` 快照（LongAdder 无锁计数） |
@@ -45,7 +45,7 @@
 │ SP 无锁哈希 SizeHashTable│      │ 写线程(绑定 ThreadID 槽位)执行:  │
 │   ·桶内有序无锁链表(CAS)  │      │  engine.put/remove (SP 计数内联) │
 │   ·per-thread size 计数  │      │  顺序链表(驱逐/TTL)维护 @ orderLock│
-└────────────────────────┘      │  驱逐/过期清扫/读计数提升        │
+└────────────────────────┘      │  驱逐(CLOCK 二次机会)/过期清扫   │
         ▲                        └──────────────────────────────┘
         │ CacheNode（value/expireAt/reads/链表链接）被哈希桶与顺序链表共同引用
         └──────────── 顺序链表 head..tail：驱逐/过期的淘汰依据
@@ -58,8 +58,10 @@
 - 结果是读吞吐不被写线程数约束，写正确性由固定槽位 + 底层 CAS 保证。
 
 **为什么驱逐只在写侧维护**：若每次读都移动 LRU 链表，读路径就要写共享内存，违背"读无锁"。
-近似 LRU 方案：**读只做一个原子自增（`CacheNode.reads`），由维护任务周期性把高频节点提升到
-队尾再淘汰队头**——读路径零链表操作（Caffeine 同源思路：读事件缓冲 + 异步维护）。
+近似 LRU 方案：**读只做一个原子自增（`CacheNode.reads`），不触碰链表**；提升推迟到
+**驱逐决策点**才兑现——驱逐时对"近期被读"的队头做**有界 CLOCK 二次机会**（复位计数、转队尾
+继续探测，上限为常数 `CLOCK_PROBES`），写成本 O(1) 且与驻留集规模无关。显式 `cleanUp()` 仍做
+整链提升（完整维护语义）。这一改动源于一次写吞吐骤降回归，详见下方 §2"LRU 提升代价修复"。
 
 **一致性口径（宽松，后端缓存惯例）**：读可能短暂看到"已驱逐但早已握住的旧节点"或"已过期但
 未清扫的条目"；读到过期值一律视为 miss，由维护任务异步收敛。
@@ -77,9 +79,11 @@
    （避免自己等自己死锁）。任务被拒发生在入队**之前**、尚未执行，因此重试/上层重试均安全。
 2. **任务队列有界 `ArrayBlockingQueue(64 + 1)`**：
    - `64` = 闸上限。排队写任务数不可能超过"闸内任务总数（≤64）"，队列再大也装不满，纯浪费内存；
-   - `+1` = 给**维护任务**留的空位。维护任务（过期清扫 / LRU 提升 / 容量驱逐）经 `drainGate`
-     合并闸限流、最多 1 个在排，且**不经准入闸**直接入队；若队列被写任务占满，它进不来会把执行到
-     一半的 `put` 打断抛错，故恒留 1 个空位保证其畅通。
+   - `+1` = 给**维护任务**留的空位。维护任务经 `drainGate` 合并闸限流、最多 1 个在排，且**不经
+     准入闸**直接入队；若队列被写任务占满，它进不来会把执行到一半的 `put` 打断抛错，故恒留
+     1 个空位保证其畅通。
+     （2026-09 更新：经 `drainGate` 排队的周期维护现仅指**过期清扫**；LRU 提升与容量驱逐已分别
+     改为驱逐点 CLOCK 二次机会与 put 内联，不再经此排队——见下节。）
 3. **过载快速失败 + 有限重试**：拿票超时（默认 5s）→ 暂停 200ms 重试 1 次 → 仍失败则打一条诊断日志
    （JUL，带当前排队数/队列长度）并抛 `RejectedExecutionException`。极端下调用方最长等待
    ≈ `2×5s + 200ms ≈ 10s` 后快速失败。
@@ -99,6 +103,55 @@
 `RejectedExecutionException` 且**该次写不生效**；正常负载不受影响——单次写微秒级、清得飞快，
 64 的闸在常规/秒杀级流量下几乎不会被填满。
 
+### LRU 提升代价修复：写吞吐骤降 ~70× → CLOCK 二次机会驱逐（2026-09 修改）
+
+**问题（工业形态基准暴露）**：给缓存配置 `maxSize > 0`（LRU 维护开启）后，写吞吐从 ~170 ops/ms
+崩到 ~2.5 ops/ms；且**纯更新场景（`putUpdates`，零驱逐）同样崩**——初步判断指向"驱逐成本"是错的。
+
+**根因（不是驱逐，是"每写一次全链扫描"）**：
+1. `put0 / putIfAbsent0` 末尾无条件调 `maybeScheduleDrain()`（`LocalCacheImpl`）；
+2. 只要 `promoteReads()` 为真（=`maxSize>0 && LRU`）就走维护调度；
+3. 该调度经 `mutator.execute(...)`：因 put 正在**写池线程**上执行，`execute` 检测到
+   `onPool` 后**就地内联**跑 `runMaintenance()`（`MutationExecutor.execute`），内含
+   `drainPromotions()`：持 `orderLock` 把整条顺序链扫一遍、逐节点 `getAndResetReads()`；
+4. 净效果：**每个 put 同步做一次 O(驻留集) 的全链扫描**——即使读计数全为 0（扫描零成果也照扫）。
+   写成本从 O(1) 变 O(n)，骤降即此。
+
+**修改点**（全部在 `lcache-core`，`LocalCacheImpl.java`；`CacheNode` 零改动）：
+1. `evictExcess()` 改为 **CLOCK 二次机会驱逐**：驱逐时对队头若"近期被读"（`getAndResetReads()>0`）
+   就复位计数并转队尾、继续探测，上限 `CLOCK_PROBES = 8`；否则淘汰。整段在 `orderLock` 下，
+   `removeIfValue` 的"防误删并发替换出的新节点"语义原样保留。FIFO 不记读计数 → 探测恒判未读，
+   退化为纯队头淘汰，行为不变。
+2. 写路径不再调度"整链提升维护"：`put/putIfAbsent` 末尾不再无条件调度维护，驱逐顺序交由
+   驱逐点的 CLOCK 探测即时兑现。纯 LRU 无 TTL → **零调度、零扫描**。
+3. 原 `maybeScheduleDrain()` 收窄为 `maybeScheduleExpirySweep()`（仅 TTL 生效）：用**合并闸
+   `drainGate`（最多 1 个在排）+ 时间闸**（距上次实际清扫不足 `expirySweepIntervalNanos` 的触发
+   no-op）把偶发的 O(驻留集) 清扫摊销到间隔之上；间隔按 `ttl/8` 派生并夹在 `[1ms, 1s]`。
+   `expireSweep()` 开头记录 `lastExpirySweepNanos`。
+4. `drainPromotions()` / `runMaintenance()` 保留，但只在显式 `cleanUp()` 走（整链提升的完整语义，
+   `EvictionPolicyTest` 依赖其确定性行为）。
+
+**为什么这样改（符合后端场景）**：读路径依旧只做一个原子自增、不触碰链表；提升只在
+**驱逐决策点**（唯一需要新鲜 LRU 次序的地方）以常数步数兑现，写成本与驻留集规模解耦；
+等效于 OS 页缓存 / 生产缓存常见的 CLOCK 二次机会，避免了"周期整链扫描"这一 O(n)/写 的病态。
+读与 `getAndResetReads` 的竞态属宽松 LRU 近似口径，可忽略。
+
+**代价/口径变化**：
+- LRU 从"维护期整链提升"改为"驱逐点 CLOCK 补偿 + cleanUp 显式整链提升"；驱逐时的淘汰次序仍
+  即时反映读计数，命中率基本不变（见 §7）；
+- 长期只读且从不驱逐/cleanUp 时，单节点 `reads` 可累计（需单 key >2^31 次读才回绕，现实可忽略，
+  回绕只影响一次 CLOCK 判定）。
+
+**实测对照（同机短参数，`-t 4`，详见 §7）**：
+
+| 场景（LOCK_FREE / INT） | 修复前 | 修复后 |
+|---|---|---|
+| putUpdates（maxSize=4096） | 2.5 ops/ms | **140.4**（≈无界上界 170） |
+| putCycling（maxSize=4096） | 2.1 | **92.6** |
+| putCycling（maxSize=16384） | ~2 | **91.4**（成本与驻留集规模无关） |
+| mixed95_5 读多写少（maxSize=4096） | 47.9 | **1492.5** |
+| mixed95_5 命中率 | 0.631 | 0.642（理论 ~0.67） |
+
 ---
 
 ## 3. JMM / 无锁 关键点（代码内都有对应注释）
@@ -113,6 +166,7 @@
 | volatile 状态可见 | `MutationExecutor.onPool`、`closed` | 收口/重入检测与关闭标记 |
 | 单飞加载协调 | `get(K,loader)` 的 `inflightLoads` | `ConcurrentHashMap` 登记进行中 Future，leader 执行 loader、其余等待 |
 | 写池背压/防 OOM | `MutationExecutor` 准入闸 `Semaphore(64)` + 有界队列 `ArrayBlockingQueue(65)` | 非池调用方持票提交、池线程重入就地执行；拿票超时 → 重试 → 打日志并抛 `RejectedExecutionException` 快速失败（详见 §2"写池过载保护"） |
+| LRU 提升 = 驱逐点 CLOCK 二次机会 | `evictExcess()` + `CacheNode.getAndResetReads` | 队头近期被读 → 复位计数、转队尾继续探测，上限 `CLOCK_PROBES=8`；读路径零改动、写成本 O(1)（详见 §2"LRU 提升代价修复"） |
 
 ---
 
@@ -131,8 +185,9 @@ croq-project/
 │   │       ├── engine/                 CacheEngine SPI + LockFree/Synchronized 实现
 │   │       └── internal/               LocalCacheImpl、CacheNode、MutationExecutor、
 │   │                                   StatsCounter、ThreadSlots
-│   ├── lcache-benchmark/       JMH 基准（引擎吞吐 / size 成本）
+│   ├── lcache-benchmark/       JMH 基准（引擎吞吐/size + 工业形态 Zipf/驱逐 + footprint 内存探测）
 │   └── lcache-demo/            后端请求场景演示（进程内，无网络）
+├── run_industrial.sh          工业形态基准一键运行脚本（HotReadZipf / WriteEviction / FootprintProbe）
 ├── _archive/                  裁剪前的研究仓库（sp-core 全量、croq-core、papers 等）归档
 └── README.md
 ```
@@ -159,6 +214,24 @@ java -cp modules/sp-size/target/classes:modules/lcache-core/target/classes:modul
 mvn -q -pl modules/lcache-benchmark -am package
 java -jar modules/lcache-benchmark/target/lcache-benchmarks.jar \
      io.lcache.benchmark.EngineThroughputBenchmark -f 1 -wi 3 -w 2s -i 5 -r 2s -t 4
+
+# 工业形态基准一键运行（读多写少 Zipf / 写密集驱逐 / -prof gc / -t 线程扫描 / footprint），
+# 内含稳定旗标与矩阵收敛建议，建议直接执行：
+bash run_industrial.sh
+
+# 或按方法/参数单跑（命中率诊断打在 stderr 的 [hot-read]/[write-evict] 行）：
+java -jar modules/lcache-benchmark/target/lcache-benchmarks.jar \
+     io.lcache.benchmark.HotReadZipfBenchmark.mixed95_5 \
+     -p engine=LOCK_FREE,SYNCHRONIZED -p keyModel=INT,STRING -p maxSize=4096,16384 \
+     -t 8 -wi 5 -w 2s -i 5 -r 2s -f 1
+java -jar modules/lcache-benchmark/target/lcache-benchmarks.jar \
+     io.lcache.benchmark.WriteEvictionBenchmark.putCycling \
+     -p engine=LOCK_FREE -p maxSize=16384 -p writerThreads=4 -t 8 -wi 3 -w 2s -i 5 -r 2s -f 1
+
+# 内存占用探测（非 JMH，独立 main；建议按提示加大堆）
+java -Xms2g -Xmx2g -XX:+UseSerialGC -XX:+AlwaysPreTouch \
+     -cp modules/lcache-benchmark/target/lcache-benchmarks.jar \
+     io.lcache.benchmark.FootprintProbe
 ```
 
 快速示例：
@@ -198,6 +271,9 @@ cache.stats().hitRate();
 | StatsTest | 3 | 命中/未命中、驱逐/过期计数、关闭统计返回空 |
 | LoadingSingleFlightTest | 3 | 并发 get(K,loader) 只执行一次 loader、失败传播、null 拒绝 |
 
+> 注：该 20 个用例在"CLOCK 二次机会驱逐"改造后复跑仍全绿——其中 `EvictionPolicyTest` 覆盖
+> "读热键 → cleanUp → 越界驱逐淘汰非热键"的确定性语义，证明 LRU 近似口径在改造后保持。
+
 ---
 
 ## 7. 基准结果（JMH，本机 4 核示例，`-t 4`）
@@ -212,6 +288,9 @@ cache.stats().hitRate();
 | putUpdate | 227 | 188 | 写路径两者都经 4 写线程收口 |
 
 > 读路径无锁收益显著；写路径因"统一经线程亲和写池"两引擎相当，差距来自引擎内部 CAS vs 锁。
+>
+> 上表为**既有历史快照**（完整 `-t 4` 长跑、改造前采集）；2026-09 工业基准（见下）为同机
+> 单 fork 1s 短参数冒烟，量纲一致但负载/参数不同，跨表横向比数字意义有限。
 
 ### size() 成本（ops/ms，`-t 8`）CacheSizeThroughputBenchmark
 
@@ -231,6 +310,45 @@ cache.stats().hitRate();
 - Phase 4 Zipf（300k 读，容量 256）：FIFO 命中率 96.85%，近似 LRU 98.87%
   （热点提升对长尾 Zipf 有效）。
 
+### 工业形态基准（2026-09 新增：HotReadZipfBenchmark / WriteEvictionBenchmark / FootprintProbe）
+
+> 目的：补足旧基准缺失的工业要素——Zipf 热点倾斜、真实淘汰压力、真实键(预构建 String)、
+> 命中率观测、内存占用。数值为**同机短参数冒烟（单 fork、`-t 4`、1s×1）**，完整复测用
+> `run_industrial.sh`（含 `-t` 线程扫描与 `-prof gc`）。写多读少场景的命中率/驱逐诊断由
+> TearDown 打印到 stderr（`[hot-read]` / `[write-evict]`）。
+
+**读多写少 · Zipf（键空间 2^18，驻留=maxSize，命中率理论 = ln(maxSize)/ln(2^18)）**
+
+| 基准 | 引擎/键/maxSize | ops/ms（修复后） | hitRate（实测） |
+|---|---|---|---|
+| mixed95_5 | LOCK_FREE / INT / 4096 | 1 492.5 | 0.642（理论 ~0.67） |
+| mixed80_20 | LOCK_FREE / INT / 16384 | — | 0.735（理论 ~0.78，20% 写含队尾键驱逐略拉低） |
+| mixed95_5 | LOCK_FREE / INT / 0（无驱逐参照） | 1 756.3 | ~满命中 |
+
+> 说明：5–20% 的 put 全部经写池收口，命中率未随 CLOCK 改造回退；旧基准混合
+> `mixedReadWrite` 也同机复测在正常量级。
+
+**写密集 + 驱逐（修复前后对照，见 §2"LRU 提升代价修复"）**
+
+| 场景（LOCK_FREE / INT，maxSize>0） | 修复前 ops/ms | 修复后 ops/ms | 备注 |
+|---|---|---|---|
+| putUpdates（maxSize=4096，纯更新） | 2.5 | 140.4 | ≈ 不加 maxSize 的无界写对照（本次实测 ≈170 ops/ms，与上表历史 putUpdate=227 参数不同） |
+| putCycling（maxSize=4096，每 put 一驱逐） | 2.1 | 92.6 | 附加每次驱逐成本 |
+| putCycling（maxSize=16384） | ~2 | 91.4 | 成本与驻留集规模无关 → O(1) 摊销达成 |
+| putCycling 驱逐自检 | — | evictions≈puts | 如 SYNCHRONIZED/STRING/max16384：evictions=318 756 |
+
+**内存占用 FootprintProbe（每条目 bytes，含 value，近似堆差量，排除 key 池）**
+
+| payload | LOCK_FREE | SYNCHRONIZED | HashMap 基线 |
+|---|---|---|---|
+| INTEGER | 132.6 | 104.6 | 56.5 |
+| STRING(32) | 140.0 | 112.0 | 64.0 |
+| byte[256] | 388.0 | 360.0 | 312.0 |
+
+> 读数：无锁实现相对全锁基线每条目多 ~28B（SP 表节点 + 每桶 header 摊销），相对裸 HashMap
+> 多 ~76B（INTEGER 档）；payload 越大结构开销占比越小。建议 `-Xmx2g -XX:+UseSerialGC` 复测
+> 以获得更稳读数。
+
 ---
 
 ## 8. 边界与使用条件（诚实清单）
@@ -240,7 +358,8 @@ cache.stats().hitRate();
 2. **定容不可扩容**：`capacity` 在构建时确定（无锁哈希不可扩容）。语义层只承诺驱逐到 `maxSize`；
    若无需容量控制请给足 `capacity`。
 3. **写线程 ≤ 64**：写路径收口到线程亲和池（`writerThreads` ∈ [1,64]），因为 SP per-thread 槽位上限 64。
-4. **size() 含未清扫的过期条目**：过期条目在"判定 miss"与"清扫移除"之间仍被计数；`cleanUp()` 后精确。
+4. **size() 含未清扫的过期条目**：过期条目在"判定 miss"与"清扫移除"之间仍被计数；过期清扫按
+   **时间闸摊销**触发（间隔 ≈ `ttl/8` 夹在 `[1ms, 1s]`），`cleanUp()` 为同步强制清扫 → 其后精确。
 5. **宽松一致性**：读与写并发时可能短暂读到旧值/过期值，按 miss 处理；不提供强线性化的 `getAndCompute` 之类。
 6. **写为同步收口 + 过载有界**：`put/invalidate` 阻塞等待写池执行，提交经有界准入闸（`Semaphore(64)`）；
    极端过载（写线程长时间无法腾出闸位）时**快速失败抛 `RejectedExecutionException`，该次写不生效**，
@@ -249,6 +368,11 @@ cache.stats().hitRate();
 7. **无持久化 / 崩溃不恢复 / 无网络层**：本缓存是**纯内存进程内组件**，不做 KV 落盘与多活。
 8. **裁剪来源**：无锁哈希来自 SP 开源实现（见 `modules/sp-size/VENDOR.md`）；上层缓存语义与
    线程收口为本项目自研。
+9. **近似 LRU = 驱逐点 CLOCK 二次机会**：提升只在驱逐决策点兑现（驱逐时对"近期被读"队头复位
+   计数并转队尾，上限 `CLOCK_PROBES=8`；`cleanUp()` 才做整链提升）。"驱逐次序反映读"是在
+   **驱逐发生时**成立的近似而非维护期即时序；写成本 O(1)、与 `maxSize` 无关。长期只读且从不
+   驱逐/`cleanUp` 时单节点读计数理论上可累计（需单 key 超 2^31 次读才回绕，可忽略，回绕只影响
+   一次 CLOCK 判定）。
 
 ---
 
