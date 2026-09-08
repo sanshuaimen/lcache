@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(javac *)",
+      "Bash(java -version)",
+      "Read(//usr/**)",
+      "Read(//opt/**)",
+      "Read(//tmp/**)",
+      "Bash(curl -sL \"https://repo1.maven.org/maven2/org/junit/jupiter/junit-jupiter-api/5.10.0/junit-jupiter-api-5.10.0.jar\" -o junit-api.jar)",
+      "Bash(curl -sL \"https://repo1.maven.org/maven2/org/junit/jupiter/junit-jupiter-engine/5.10.0/junit-jupiter-engine-5.10.0.jar\" -o junit-engine.jar)",
+      "Bash(curl -sL \"https://repo1.maven.org/maven2/org/junit/platform/junit-platform-launcher/1.10.0/junit-platform-launcher-1.10.0.jar\" -o platform-launcher.jar)",
+      "Bash(curl -sL \"https://repo1.maven.org/maven2/org/junit/platform/junit-platform-engine/1.10.0/junit-platform-engine-1.10.0.jar\" -o platform-engine.jar)",
+      "Bash(java *)",
+      "Bash(curl *)",
+      "Bash(rm -rf /tmp/croq-build)",
+      "Bash(mkdir -p /tmp/croq-build)",
+      "Bash(javac -d /tmp/croq-build /data/data/liaoxue/SP/croq-project/sp-core/measurements/support/ThreadID.java /data/data/liaoxue/SP/croq-project/sp-core/algorithms/baseline/HashTable.java /data/data/liaoxue/SP/croq-project/sp-core/algorithms/size/core/UpdateOperations.java /data/data/liaoxue/SP/croq-project/sp-core/algorithms/size/core/UpdateInfoHolder.java /data/data/liaoxue/SP/croq-project/sp-core/algorithms/size/core/UpdateInfo.java /data/data/liaoxue/SP/croq-project/sp-core/algorithms/size/core/Backoff.java /data/data/liaoxue/SP/croq-project/sp-core/algorithms/size/core/SizeCalculator.java /data/data/liaoxue/SP/croq-project/croq-core/src/main/java/croq/memsnap/MemSnap.java /data/data/liaoxue/SP/croq-project/croq-core/src/main/java/croq/memsnap/MemSnapPersistence.java /data/data/liaoxue/SP/croq-project/croq-core/src/main/java/croq/coor/CroqHashTable.java)",
+      "Bash(javac -d /tmp/croq-build -cp /tmp/croq-build:/tmp/junit-api.jar:/tmp/junit-engine.jar:/tmp/platform-launcher.jar:/tmp/platform-engine.jar:/tmp/platform-commons.jar:/tmp/opentest4j.jar /data/data/liaoxue/SP/croq-project/croq-core/src/test/java/croq/coor/CroqHashTableTest.java)",
+      "Bash(javac -d /tmp/croq-build -cp /tmp/croq-build:/tmp/junit-api.jar:/tmp/junit-engine.jar:/tmp/platform-launcher.jar:/tmp/platform-engine.jar:/tmp/platform-commons.jar:/tmp/opentest4j.jar /data/data/liaoxue/SP/croq-project/croq-core/src/test/java/croq/memsnap/MemSnapTest.java /data/data/liaoxue/SP/croq-project/croq-core/src/test/java/croq/coor/CroqHashTableTest.java)",
+      "Bash(mvn --version)",
+      "Bash(python3 -c \"import matplotlib; print\\('matplotlib:', matplotlib.__version__\\)\")",
+      "Bash(chmod +x *)",
+      "Bash(tar -xzf /tmp/maven.tar.gz -C /tmp/)",
+      "Bash(rm -f /tmp/maven.tar.gz)",
+      "Bash(curl -sL \"https://dlcdn.apache.org/maven/maven-3/3.9.6/binaries/apache-maven-3.9.6-bin.tar.gz\" --connect-timeout 10 --max-time 120 -o /tmp/maven.tar.gz)",
+      "Bash(curl -sL \"https://repo1.maven.org/maven2/org/apache/maven/apache-maven/3.9.6/apache-maven-3.9.6-bin.tar.gz\" -o /tmp/maven.tar.gz --connect-timeout 10 --max-time 120)",
+      "Bash(python3 *)",
+      "Bash(mvn -o -q -pl modules/lcache-core -am compile)",
+      "Bash(mvn -q -pl modules/lcache-core -am compile)",
+      "Bash(mvn -pl modules/lcache-core -am compile)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(mvn -pl modules/lcache-core -am test)"
+    ]
+  }
+}

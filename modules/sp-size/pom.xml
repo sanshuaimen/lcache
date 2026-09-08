@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sp-size：嵌入式 SP（Concurrent Size）无锁 size 算法的 vendor 子集。
+
+  从原 croq-project 研究仓库裁剪，仅保留"无锁哈希表 SizeHashTable + per-thread 计数
+  (SizeCalculator/UpdateOperations/.../ThreadID)"这一组实现，作为 lcache-core 的无锁数据面。
+  源码包名（algorithms.size.* / measurements.support.*）保持与上游一致，未经修改。
+  原始版权与 GPL v3 头保留在各文件内；来源见 modules/sp-size/VENDOR.md。
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.lcache</groupId>
+        <artifactId>lcache-parent</artifactId>
+        <version>1.0.0</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>sp-size</artifactId>
+    <name>sp-size</name>
+    <description>嵌入式 SP 无锁 size 算法 vendor 子集（纯 JDK）</description>
+
+    <dependencies>
+        <!-- 无运行依赖 -->
+    </dependencies>
+</project>
