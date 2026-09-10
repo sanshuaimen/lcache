@@ -59,9 +59,6 @@ import java.util.concurrent.atomic.AtomicLong;
 @Fork(1)
 public class WriteEvictionBenchmark {
 
-    private static final int KEY_SPACE = 1 << 18;
-    private static final int CAPACITY = 1 << 16;
-
     private static final Integer[] VALUES = new Integer[256];
 
     static {
@@ -72,13 +69,19 @@ public class WriteEvictionBenchmark {
 
     @Param({"LOCK_FREE", "SYNCHRONIZED"})
     private String engine;
+    /**
+     * 键空间（环形驱逐穿行的范围），须为 2 的幂。默认 2^18 冒烟档；
+     * 旗舰 1GB 驻留 = {@code -p keySpace=67108864 -p maxSize=8388608}。
+     */
+    @Param({"262144"})
+    private int keySpace;
     /** INT：Integer 键；STRING：预构建 {@code "k"+i} 键（Setup 一次建好，op 内零分配）。 */
     @Param({"INT", "STRING"})
     private String keyModel;
     @Param({"4096", "16384"})
     private int maxSize;
     /** 写池线程数（put 在此执行；1..64）。 */
-    @Param({"4", "8"})
+    @Param({"1", "4", "8"})
     private int writerThreads;
 
     private LocalCache<Object, Object> cache;
@@ -87,24 +90,36 @@ public class WriteEvictionBenchmark {
     private AtomicLong ringCursor;
     private int resident;
 
+    /** 桶数：向上取 ≥ max(2^16, 2×驻留) 的 2 的幂（SP 表定容不可扩容；负载 ≈0.5 链短）。 */
+    private static int capacityFor(int resident) {
+        long want = Math.max(1L << 16, (long) resident << 1);
+        long p = Long.highestOneBit(want);
+        long c = p < want ? p << 1 : p;
+        return c >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) c;
+    }
+
     @Setup(Level.Trial)
     public void setup() {
-        resident = Math.min(maxSize, KEY_SPACE);
+        resident = Math.min(maxSize, keySpace);
+        if (maxSize > keySpace) {
+            System.err.println("[warn] write-evict: maxSize(" + maxSize + ") > keySpace(" + keySpace
+                    + ")，驻留按 keySpace 截断");
+        }
         cache = LocalCache.<Object, Object>builder()
-                .capacity(CAPACITY)
+                .capacity(capacityFor(resident))
                 .maxSize(maxSize)
                 .policy(PolicyKind.LRU)
                 .engine(EngineKind.valueOf(engine))
                 .writerThreads(writerThreads)
                 .recordStats()
                 .build();
-        keys = new Object[KEY_SPACE];
+        keys = new Object[keySpace];
         if (keyModel.equals("INT")) {
-            for (int i = 0; i < KEY_SPACE; i++) {
+            for (int i = 0; i < keySpace; i++) {
                 keys[i] = Integer.valueOf(i);
             }
         } else {
-            for (int i = 0; i < KEY_SPACE; i++) {
+            for (int i = 0; i < keySpace; i++) {
                 keys[i] = "k" + i;
             }
         }
@@ -146,7 +161,7 @@ public class WriteEvictionBenchmark {
     @Benchmark
     public void putCycling(Blackhole bh) {
         long i = ringCursor.getAndIncrement();
-        int rank = (int) (i & (KEY_SPACE - 1));
+        int rank = (int) (i & (keySpace - 1));
         bh.consume(cache.put(keys[rank], VALUES[(int) (i & 255)]));
     }
 }

@@ -2,6 +2,8 @@ target/
 !.mvn/wrapper/maven-wrapper.jar
 *.class
 *.log
+# run_industrial.sh 生成的机器相关基准汇总表
+industrial_scale_report.md
 .idea/
 *.iml
 .vscode/

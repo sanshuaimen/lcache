@@ -21,21 +21,21 @@ import java.util.Map;
  *
  * <p>SP 无锁表每桶预分配一个 header Node（固定表），容量按 2 的幂取整、无法缩容；HashMap
  * 自增表。此不对称正是本探测要展示的（"固定桶数摊销"）。堆差量是近似值：
- * 建议 <code>-Xms2g -Xmx2g -XX:+UseSerialGC -XX:+AlwaysPreTouch</code> 运行以获得更稳读数。
+ * 建议 <code>-Xms4g -Xmx4g -XX:+UseSerialGC -XX:+AlwaysPreTouch</code> 运行以获得更稳读数。
  *
  * <p>运行（从 shaded jar 直接以 main 跑，绕过 JMH）：
  * <pre>
- *   java -Xms2g -Xmx2g -XX:+UseSerialGC -XX:+AlwaysPreTouch \
+ *   java -Xms4g -Xmx4g -XX:+UseSerialGC -XX:+AlwaysPreTouch \
  *        -cp modules/lcache-benchmark/target/lcache-benchmarks.jar \
  *        io.lcache.benchmark.FootprintProbe
  * </pre>
  */
 public final class FootprintProbe {
 
-    /** 驻留规模：两个点求边际斜率。 */
-    private static final int[] SIZES = {1 << 18, 1 << 19};
+    /** 驻留规模（百万级，两个点求边际斜率；INTEGER 8M 可外推 ≈1GB）。 */
+    private static final int[] SIZES = {1 << 20, 1 << 21};
 
-    private static final Integer[] KEY_POOL = new Integer[1 << 19];
+    private static final Integer[] KEY_POOL = new Integer[1 << 21];
 
     static {
         for (int i = 0; i < KEY_POOL.length; i++) {
@@ -88,7 +88,7 @@ public final class FootprintProbe {
     public static void main(String[] args) {
         System.out.println("== lcache FootprintProbe ==");
         System.out.println("读法：差量 = 表/桶 + 条目节点 + value（key 已在建表前预分配、被排除）。");
-        System.out.println("建议 -Xms2g -Xmx2g -XX:+UseSerialGC -XX:+AlwaysPreTouch，堆差量为近似值。\n");
+        System.out.println("建议 -Xms4g -Xmx4g -XX:+UseSerialGC -XX:+AlwaysPreTouch，堆差量为近似值。\n");
 
         for (Payload p : Payload.values()) {
             // [engine][sizeIdx] 的 used-heap（相对当前 payload 基线的增量）

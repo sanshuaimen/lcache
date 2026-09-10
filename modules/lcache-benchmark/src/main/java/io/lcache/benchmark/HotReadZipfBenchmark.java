@@ -38,13 +38,16 @@ import java.util.concurrent.atomic.AtomicLong;
  * 百万级读可忽略，误差约 1–2%；{@code recordStats()} 会给每次读加两次 LongAdder 自增，
  * 报出的 ops/s 含少量"统计税"——要纯引擎吞吐，用同一配置把 {@code .recordStats()} 关掉再跑一次。
  *
+ * <p>读扩展曲线用 {@link #read}（纯读、不吃写池，读吞吐随 {@code -t} 近线性）；
+ * 真实读写混合用 {@link #mixed95_5}/{@link #mixed80_20}（写路径收口写池，保持 {@code -t ≤ 16}）。
+ * 旗舰 1GB 驻留档：{@code -p keySpace=67108864 -p maxSize=8388608}（INT 键）。
+ *
  * <p>运行（矩阵较大，建议用 {@code -p} 收敛；见 README/run_industrial.sh）：
  * <pre>
  *   java -jar modules/lcache-benchmark/target/lcache-benchmarks.jar \
- *        io.lcache.benchmark.HotReadZipfBenchmark -p engine=LOCK_FREE -p keyModel=INT \
- *        -p maxSize=4096,16384 -t 8 -wi 3 -w 2s -i 5 -r 2s -f 1
+ *        io.lcache.benchmark.HotReadZipfBenchmark.read -p engine=LOCK_FREE -p keyModel=INT \
+ *        -p keySpace=67108864 -p maxSize=8388608 -t 1,8,16,32,64 -wi 3 -w 1s -i 5 -r 1s -f 1
  * </pre>
- * 写密集并发约束：put 阻塞在写池 → 保持 {@code -t ≤ 16}。
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.Throughput)
@@ -53,11 +56,6 @@ import java.util.concurrent.atomic.AtomicLong;
 @Measurement(iterations = 3, time = 1)
 @Fork(1)
 public class HotReadZipfBenchmark {
-
-    /** 键空间（含大量"永远 miss"的队尾键）。 */
-    private static final int KEY_SPACE = 1 << 18;
-    /** 显式桶数（SP 表固定、按 2 的幂取整）；≥ 最大驻留集即可。 */
-    private static final int CAPACITY = 1 << 16;
 
     private static final Integer[] VALUES = new Integer[256];
 
@@ -69,6 +67,12 @@ public class HotReadZipfBenchmark {
 
     @Param({"LOCK_FREE", "SYNCHRONIZED"})
     private String engine;
+    /**
+     * 键空间（含大量"永远 miss"的队尾键），须为 2 的幂。默认 2^18 冒烟档；
+     * 旗舰 1GB 驻留 = {@code -p keySpace=67108864 -p maxSize=8388608}（JMH {@code -p} 可给 @Param 之外的值）。
+     */
+    @Param({"262144"})
+    private int keySpace;
     /** INT：Integer 键；STRING：预构建 {@code "k"+i} 键（Setup 一次建好，op 内零分配）。 */
     @Param({"INT", "STRING"})
     private String keyModel;
@@ -80,28 +84,41 @@ public class HotReadZipfBenchmark {
     private ZipfKeySpace zipf;
     private Object[] keys;
 
+    /** 桶数：向上取 ≥ max(2^16, 2×驻留) 的 2 的幂（SP 表定容不可扩容；负载 ≈0.5 链短）。 */
+    private static int capacityFor(int resident) {
+        long want = Math.max(1L << 16, (long) resident << 1);
+        long p = Long.highestOneBit(want);
+        long c = p < want ? p << 1 : p;
+        return c >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) c;
+    }
+
     @Setup(Level.Trial)
     public void setup() {
-        int prefill = maxSize > 0 ? maxSize : KEY_SPACE;
+        // 驻留 = maxSize（热集）；maxSize=0 → 全量 keySpace 驻留；maxSize>keySpace → 截断防越界
+        int prefill = maxSize > 0 ? Math.min(maxSize, keySpace) : keySpace;
+        if (maxSize > keySpace) {
+            System.err.println("[warn] hot-read: maxSize(" + maxSize + ") > keySpace(" + keySpace
+                    + ")，驻留按 keySpace 截断");
+        }
         cache = LocalCache.<Object, Object>builder()
-                .capacity(CAPACITY)
+                .capacity(capacityFor(prefill))
                 .maxSize(maxSize)
                 .policy(PolicyKind.LRU)
                 .engine(EngineKind.valueOf(engine))
                 .writerThreads(4)
                 .recordStats()
                 .build();
-        keys = new Object[KEY_SPACE];
+        keys = new Object[keySpace];
         if (keyModel.equals("INT")) {
-            for (int i = 0; i < KEY_SPACE; i++) {
+            for (int i = 0; i < keySpace; i++) {
                 keys[i] = Integer.valueOf(i);
             }
         } else {
-            for (int i = 0; i < KEY_SPACE; i++) {
+            for (int i = 0; i < keySpace; i++) {
                 keys[i] = "k" + i;
             }
         }
-        zipf = new ZipfKeySpace(KEY_SPACE, 1.0d);
+        zipf = new ZipfKeySpace(keySpace, 1.0d);
         // 预填最热的 prefill 个键；maxSize=0 时全量驻留
         for (int i = 0; i < prefill; i++) {
             cache.put(keys[i], VALUES[i & 255]);
@@ -148,5 +165,16 @@ public class HotReadZipfBenchmark {
         } else {
             bh.consume(cache.getIfPresent(k));
         }
+    }
+
+    /**
+     * 纯读：100% {@code getIfPresent}，不触写池/驱逐 → 读吞吐随 {@code -t} 近线性扩展，
+     * 不被写池限速。仍保留 Zipf 冷尾 miss → hitRate ≈ 理论 ln(maxSize)/ln(keySpace)
+     * （旗舰 2^23/2^26 ≈ 0.885；maxSize=0 时全命中）。
+     */
+    @Benchmark
+    public void read(Blackhole bh, Thd thd) {
+        int rank = zipf.sample(thd.rnd);
+        bh.consume(cache.getIfPresent(keys[rank]));
     }
 }
