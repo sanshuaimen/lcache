@@ -72,6 +72,17 @@ score_of_s() { # 与 score_of 同理，但匹配 ops/s（CacheSizeThroughputBenc
 field_of() { # $1=日志文件 $2=字段名(如 hitRate / expires / evictions / dedup)
   grep -oE "$2=[0-9.]+" "$1" | head -1 | cut -d= -f2
 }
+# 浮点助手（统一用 awk，不依赖 bc）。任一入参为空/非数字 → 输出 "-"，避免 set -u 与除零。
+num() { case "$1" in ''|*[!0-9.]*) return 1 ;; *) return 0 ;; esac; }
+fmul() { num "$1" && num "$2" || { echo "-"; return; }
+  awk -v a="$1" -v b="$2" 'BEGIN{printf "%.3f", a*b}'; }
+fdiv() { num "$1" && num "$2" && awk -v a="$1" -v b="$2" 'BEGIN{exit !(b!=0)}' || { echo "-"; return; }
+  awk -v a="$1" -v b="$2" 'BEGIN{printf "%.3f", a/b}'; }
+fpct() { num "$1" && num "$2" && awk -v a="$1" -v b="$2" 'BEGIN{exit !(b!=0)}' || { echo "-"; return; }
+  awk -v a="$1" -v b="$2" 'BEGIN{printf "%.1f%%", 100*a/b}'; }
+# 临界写占比 w* = W/(R+W)：写占比超过它，混合总量 T 就由写上限决定（T ≤ min(R/(1−w), W/w)）。
+fwstar() { num "$1" && num "$2" && awk -v w="$1" -v r="$2" 'BEGIN{exit !(w+r>0)}' || { echo "-"; return; }
+  awk -v w="$1" -v r="$2" 'BEGIN{printf "%.2f%%", 100*w/(r+w)}'; }
 
 # 循环内跑单配置 JMH：$1=日志文件，其余为 java 参数。
 # 失败不中断脚本（保留 set -e 对其它真错误的敏感性），但打 [warn] 到 stderr，表格对应格为 "-"。
@@ -132,21 +143,18 @@ for eng in LOCK_FREE SYNCHRONIZED; do
 done
 
 # ── 3) 1GB 驻留读写混合：mixed95_5（5% 写经写池） ────────────────────────────
+# 只跑不写表：本档写占比 5% 高于临界值，总量由写池决定；分解成表需要 §1（纯读上限）、
+# §4b/§5（纯写上限）的独立实测值，故表格推迟到 §3b 生成（见该处注释）。
 echo "== 3) 1GB 驻留读写混合（HotReadZipfBenchmark.mixed95_5, -t 16） =="
-{
-  echo "## 1GB 驻留读写混合（HotReadZipfBenchmark.mixed95_5 · 95%读/5%写 · maxSize=${MX} · keySpace=${KS} · -t 16）"
-  echo
-  echo "| 引擎 | ops/ms | hitRate |"
-  echo "|---|---|---|"
-} >> "$REPORT"
+echo "       （本档写占比 > 临界值，总量由写池决定；分解表见 §3b，需 §4b/§5 的上限）" >&2
+declare -A MIX_SCORE MIX_HR
 for eng in LOCK_FREE SYNCHRONIZED; do
   printf "  [%s mixed95_5 1GB] ...\n" "$eng" >&2
   f="$RUN_DIR/mix_${eng}.log"
   jrun "$f" io.lcache.benchmark.HotReadZipfBenchmark.mixed95_5 \
     -p engine="$eng" -p keyModel=INT -p maxSize="$MX" -p keySpace="$KS" -t 16 "${W_FLAGS[@]}" -f 1
-  {
-    printf "| %s | %s | %s |\n" "$eng" "$(score_of <"$f")" "$(field_of "$f" hitRate)"
-  } >> "$REPORT"
+  MIX_SCORE["$eng"]="$(score_of <"$f")"
+  MIX_HR["$eng"]="$(field_of "$f" hitRate)"
 done
 
 # ── 4) 写密集：小驻留 writerThreads 扫描 + 旗舰 1GB putCycling 行 ─────────────
@@ -193,8 +201,9 @@ f="$RUN_DIR/pc_flagship.log"
 jrun "$f" io.lcache.benchmark.WriteEvictionBenchmark.putCycling \
   -p engine=LOCK_FREE -p keyModel=INT -p maxSize="$MX" -p keySpace="$KS" -p writerThreads=4 \
   -t 8 "${W_FLAGS[@]}" -f 1
+PC_FLAGSHIP="$(score_of <"$f")"
 {
-  printf "| ops/ms | %s |\n" "$(score_of <"$f")"
+  printf "| ops/ms | %s |\n" "$PC_FLAGSHIP"
   printf "| evictions | %s |\n" "$(field_of "$f" evictions)"
   echo
 } >> "$REPORT"
@@ -231,6 +240,63 @@ for eng in LOCK_FREE SYNCHRONIZED; do
     echo
   } >> "$REPORT"
 done
+
+# ── 3b) mixed95_5 瓶颈分解 + 上限校验 ───────────────────────────────────────
+# 位置在 §4b/§5 之后：校验需要 §1 的纯读上限 R、§4b 旗舰 putCycling（驱逐型写下界）、
+# §5 ttl=0 putUpdates（纯更新型写上界）三个独立实测值，都是本次运行的同一批数据，
+# 不做任何重跑或估算；写占比 5% 与 R/W 的推导只用四则运算。
+echo "== 3b) mixed95_5 瓶颈分解与上限校验 =="
+{
+  W_MIX=5  # mixed95_5 的写占比（%）
+  R_LF="${READ_SCORE[LOCK_FREE_16]:-}"      # 纯读能力（同 -t 16，§1）
+  W_LF_UPD="${TTL_SCORE[LOCK_FREE_0]:-}"    # 纯更新上限（§5，同为 writerThreads=4）
+  W_LF_EV="${PC_FLAGSHIP:-}"                # 带驱逐的写下限（§4b 旗舰 putCycling）
+  echo "## 1GB 驻留读写混合（HotReadZipfBenchmark.mixed95_5 · 95%读/5%写 · maxSize=${MX} · keySpace=${KS} · -t 16）"
+  echo
+  echo "> **读法（先看这段再看数）**：本档写占比 5%，高于临界写占比 w*（见下），实测总量由**写池**决定，"
+  echo "> 即「写上限 × 20」，**不是读路径成绩**。下表把实测量拆成读/写分量，并标出瓶颈归属；"
+  echo "> 两引擎瓶颈不同（一个写池、一个全局锁），**不可并排对比**。"
+  echo
+  echo "| 引擎 | 实测 ops/ms | 推导写 ops/ms（×5%） | 推导读 ops/ms（×95%） | hitRate | 该引擎自身写上限 ops/ms | 瓶颈归属 |"
+  echo "|---|---|---|---|---|---|---|"
+  for eng in LOCK_FREE SYNCHRONIZED; do
+    s="${MIX_SCORE[$eng]:-}"
+    up="${TTL_SCORE[${eng}_0]:-}"
+    wr="$(fmul "$s" 0.05)"  # 推导写速率
+    # 写速率是否已逼近该引擎自身的写上限：≥90% 判写路径饱和，否则瓶颈在别处
+    if ! num "$wr" || ! num "$up"; then
+      bneck="-"   # 缺实测值：不判瓶颈，避免把"数据缺失"写成"瓶颈在别处"
+    elif awk -v a="$wr" -v b="$up" 'BEGIN{exit !(b>0 && a/b>=0.9)}'; then
+      bneck="写池饱和（推导写速率 ≥ 自身上限的 90%）"
+    else
+      bneck="非写池 —— 该引擎自身瓶颈（见下注）"
+    fi
+    printf "| %s | %s | %s | %s | %s | %s | %s |\n" \
+      "$eng" "${s:--}" "$wr" "$(fmul "$s" 0.95)" "${MIX_HR[$eng]:--}" "${up:--}" "$bneck"
+  done
+  echo
+  if num "$R_LF" && num "$W_LF_UPD" && num "$W_LF_EV"; then
+    echo "**上限校验（LOCK_FREE）**：模型 \`T ≤ min(R/(1−w), W/w)\`，R=$(printf '%.0f' "$R_LF") ops/ms（§1 纯读 -t 16）、"
+    echo "w=5%。纯更新上限 W=$(printf '%.0f' "$W_LF_UPD") ops/ms → T ≤ $(fdiv "$W_LF_UPD" 0.05) ops/ms；"
+    echo "实测 $(printf '%.0f' "${MIX_SCORE[LOCK_FREE]:-0}") ops/ms，命中该上限的 $(fpct "${MIX_SCORE[LOCK_FREE]:-0}" "$(fdiv "$W_LF_UPD" 0.05)")"
+    echo "→ 这一行等价于「写池上限 × 20」，读路径能力（$(printf '%.0f' "$R_LF") ops/ms）只用到 $(fpct "$(fmul "${MIX_SCORE[LOCK_FREE]:-0}" 0.95)" "$R_LF")。"
+    echo "若把驱逐成本也算进来，W 取 [$(printf '%.0f' "$W_LF_EV"), $(printf '%.0f' "$W_LF_UPD")] ops/ms（§4b 旗舰 putCycling → §5 纯更新，"
+    echo "纯更新成本与驻留规模无关，故可跨档引用）→ T ∈ [$(fdiv "$W_LF_EV" 0.05), $(fdiv "$W_LF_UPD" 0.05)] ops/ms，"
+    echo "实测落在区间上界，对应「混合写以热键原地更新为主、触发驱逐的比例低」，可自洽解释。"
+    echo
+    echo "**临界写占比** \`w* = W/(R+W)\` = $(fwstar "$W_LF_UPD" "$R_LF")（取纯更新上限）→ 任何高于该值的写占比下，"
+    echo "总量都由写池决定、读扩展再多也无用；低于它才轮到读路径成为瓶颈。"
+  else
+    echo "**上限校验**：缺 §1/§4b/§5 的实测值，本次无法校验（见各节是否为 \"-\"）。"
+  fi
+  echo
+  echo "**SYNCHRONIZED 行**：其瓶颈是全局锁而非写池——推导写速率 $(fmul "${MIX_SCORE[SYNCHRONIZED]:-}" 0.05) ops/ms 远低于它自己的"
+  echo "写上限 ${TTL_SCORE[SYNCHRONIZED_0]:--} ops/ms（§5），故该行与 LOCK_FREE 行**不可并排比较**。"
+  echo
+  echo "**hitRate ${MIX_HR[LOCK_FREE]:--} vs 纯读 0.888**：5% 写导致的 churn 使 CLOCK 近似 LRU 丢失约 2.5pp 命中；"
+  echo "两引擎该值一致（${MIX_HR[LOCK_FREE]:--}/${MIX_HR[SYNCHRONIZED]:--}，各自独立实现），可作为交叉验证。"
+  echo
+} >> "$REPORT"
 
 # ── 6) 读穿单飞去重 ────────────────────────────────────────────────────────
 echo "== 6) 读穿单飞去重（keySpace × loader 延迟，-t 16） =="

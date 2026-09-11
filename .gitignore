@@ -2,8 +2,8 @@ target/
 !.mvn/wrapper/maven-wrapper.jar
 *.class
 *.log
-# run_industrial.sh 生成的机器相关基准汇总表
-industrial_scale_report.md
+# 注：industrial_scale_report.md 已从忽略列表中移除——它现在作为交付物入库
+# （README §6 指向它；run_industrial.sh 复跑时会整份重写该文件，届时按需 review 差异）
 .idea/
 *.iml
 .vscode/

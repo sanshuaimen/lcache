@@ -39,7 +39,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * 报出的 ops/s 含少量"统计税"——要纯引擎吞吐，用同一配置把 {@code .recordStats()} 关掉再跑一次。
  *
  * <p>读扩展曲线用 {@link #read}（纯读、不吃写池，读吞吐随 {@code -t} 近线性）；
- * 真实读写混合用 {@link #mixed95_5}/{@link #mixed80_20}（写路径收口写池，保持 {@code -t ≤ 16}）。
+ * 真实读写混合用 {@link #mixed95_5}/{@link #mixed80_20}（写路径收口写池，保持 {@code -t ≤ 16}；
+ * 注意这两档的写占比都高于临界写占比 {@code w*}，总量由写池决定，取值口径见 {@link #mixed95_5}）。
  * 旗舰 1GB 驻留档：{@code -p keySpace=67108864 -p maxSize=8388608}（INT 键）。
  *
  * <p>运行（矩阵较大，建议用 {@code -p} 收敛；见 README/run_industrial.sh）：
@@ -143,7 +144,16 @@ public class HotReadZipfBenchmark {
         final SplittableRandom rnd = new SplittableRandom(SEEDS.getAndAdd(0x9E3779B97F4A7C15L));
     }
 
-    /** 95% 读 / 5% 写。 */
+    /**
+     * 95% 读 / 5% 写。
+     *
+     * <p><b>读法</b>：写操作同步收口写池（调用方阻塞等结果），写池有硬上限 W（本机 wt=4 约
+     * 2.4e5 ops/s，见 {@link WriteEvictionBenchmark} 与 {@link TtlExpirySweepBenchmark}）。
+     * 总量满足 {@code T ≤ min(R/(1−w), W/w)}，临界写占比 {@code w* = W/(R+W)} 仅约 1.7%
+     * （R 为纯读能力）——故本档 w=5% 时<b>总量由写池决定（≈W/0.05）</b>，不是读路径成绩；
+     * {@link #mixed80_20} 只会更彻底。要读路径主导的混合吞吐，写占比须降到 w* 以下，
+     * 或改看 {@link #read}。报告侧由 {@code run_industrial.sh} 的 §3b 做该分解与上限校验。
+     */
     @Benchmark
     public void mixed95_5(Blackhole bh, Thd thd) {
         int rank = zipf.sample(thd.rnd);
